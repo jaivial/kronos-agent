@@ -6,6 +6,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# If running from node_modules, walk up to the real project root (where .git lives)
+if echo "$ROOT" | grep -q "node_modules"; then
+    REAL_ROOT="$(cd "$ROOT/../.." && pwd)"
+    if [ -d "$REAL_ROOT/.git" ]; then
+        ROOT="$REAL_ROOT"
+    fi
+fi
+
 echo "=== kronos-agent installer ==="
 echo "Root: $ROOT"
 

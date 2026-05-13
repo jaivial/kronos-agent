@@ -460,16 +460,20 @@ def build_mcp_config(agent_name: str, flow_id: str,
         },
     }
     if agent_name in ("wide_research", "planner"):
-        servers["kraken-code-search"] = {
-            "command": "python3",
-            "args": [str(ROOT / "python" / "kraken_search_mcp.py")],
-        }
+        search_mcp = ROOT / "python" / "kraken_search_mcp.py"
+        if search_mcp.exists():
+            servers["kraken-code-search"] = {
+                "command": "python3",
+                "args": [str(search_mcp)],
+            }
     if agent_name == "validator_2":
-        servers["agent-browser"] = {
-            "command": "python3",
-            "args": ["/root/.hermes/mcp-servers/agent-browser-mcp.py"],
-            "env": {},
-        }
+        browser_mcp = Path("/root/.hermes/mcp-servers/agent-browser-mcp.py")
+        if browser_mcp.exists():
+            servers["agent-browser"] = {
+                "command": "python3",
+                "args": [str(browser_mcp)],
+                "env": {},
+            }
     if agent_name == "executor":
         servers["filesystem"] = {
             "command": "npx",
