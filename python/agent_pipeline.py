@@ -146,7 +146,8 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
         return
 
     project_path = flow["project_path"]
-    print(f"[pipeline] Spawning {step_name} for flow {flow_id[:8]} project={project_path}", flush=True)
+    claude_bin = flow.get("claude_bin")  # per-flow binary override
+    print(f"[pipeline] Spawning {step_name} for flow {flow_id[:8]} project={project_path} bin={claude_bin or 'default'}", flush=True)
 
     # Build MCP config for this agent
     mcp_config = agent_spawner.build_mcp_config(step_name, flow_id, project_path)
@@ -176,6 +177,7 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
         prompt_override=prompt_override,
         timeout_seconds=600 if step_name != "validator_2" else 900,
         max_turns=40 if step_name != "wide_research" else 25,
+        claude_bin=claude_bin,
     )
 
     # Update flow status
@@ -253,6 +255,8 @@ def _run_executor_phases(flow_id: str, project_path: str) -> None:
     Reads the plan artifact, iterates phases, spawns one executor per phase.
     After all phases complete, advances to validator_1.
     """
+    flow = agent_db.get_flow(flow_id)
+    claude_bin = (flow or {}).get("claude_bin")
     phases = _read_plan_phases(flow_id)
     if not phases:
         # No plan found — run single executor (legacy fallback)
@@ -295,6 +299,7 @@ def _run_executor_phases(flow_id: str, project_path: str) -> None:
             phase_number=phase_num,
             timeout_seconds=AGENT_DEFAULTS["executor"]["timeout_seconds"],
             max_turns=AGENT_DEFAULTS["executor"]["max_turns"],
+            claude_bin=claude_bin,
         )
 
         agent_db.update_flow_status(flow_id, "executing", current_step=step_name)
@@ -455,6 +460,7 @@ class SubmitRequest(BaseModel):
     qdrant_collection: str | None = None
     priority: str = "normal"
     metadata: dict | None = None
+    claude_bin: str | None = None  # "claude" | "claudio" — defaults to auto-detect
 
 
 class StepCompleteRequest(BaseModel):
@@ -477,6 +483,7 @@ async def submit_task(req: SubmitRequest) -> dict:
         qdrant_collection=req.qdrant_collection,
         priority=req.priority,
         metadata=req.metadata,
+        claude_bin=req.claude_bin,
     )
     # Start first agent in background
     t = threading.Thread(

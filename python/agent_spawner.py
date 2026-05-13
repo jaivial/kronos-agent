@@ -35,6 +35,7 @@ class AgentSpawnConfig:
     max_turns: int = 40
     prompt_override: str | None = None  # for retry scenarios
     phase_number: int | None = None     # for multi-phase executor (None = run all)
+    claude_bin: str | None = None       # per-flow override: "claude" | "claudio"
 
 
 @dataclass
@@ -358,13 +359,18 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
     role_prompt = build_agent_role_prompt(config.agent_name)
     full_system = mini_claude + "\n\n" + role_prompt
 
+    # Resolve binary: per-flow override → config default
+    import shutil
+    bin_name = config.claude_bin or CLAUDE_BIN
+    bin_path = shutil.which(bin_name) or bin_name
+
     # If retry, prepend the override context
     user_prompt = config.user_prompt
     if config.prompt_override:
         user_prompt = config.prompt_override + "\n\n" + user_prompt
 
     cmd: list[str] = [
-        CLAUDE_BIN,
+        bin_path,
         "--print",
         "--permission-mode", "bypassPermissions",
         "--output-format", "json",

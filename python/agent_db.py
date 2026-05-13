@@ -156,6 +156,8 @@ def init() -> None:
         cols = [r[1] for r in c.execute("PRAGMA table_info(task_flows)").fetchall()]
         if "react_flow_json" not in cols:
             c.execute("ALTER TABLE task_flows ADD COLUMN react_flow_json TEXT")
+        if "claude_bin" not in cols:
+            c.execute("ALTER TABLE task_flows ADD COLUMN claude_bin TEXT")
 
 
 # ─── Task Flows ───────────────────────────────────────────────────────────
@@ -170,6 +172,7 @@ def create_task_flow(
     priority: str = "normal",
     metadata: dict | None = None,
     current_step: str = "wide_research",
+    claude_bin: str | None = None,
 ) -> str:
     """Create a new task flow. Returns the flow UUID."""
     import uuid
@@ -179,12 +182,13 @@ def create_task_flow(
             """
             INSERT INTO task_flows
               (id, source, project_path, qdrant_collection, original_prompt,
-               priority, current_step, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               priority, current_step, metadata_json, claude_bin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (flow_id, source, project_path, qdrant_collection, prompt,
              priority, current_step,
-             json.dumps(metadata or {})),
+             json.dumps(metadata or {}),
+             claude_bin),
         )
         _emit_event(c, flow_id, "flow_created",
                     {"id": flow_id, "source": source,

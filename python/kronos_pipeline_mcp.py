@@ -120,6 +120,10 @@ TOOLS = [
                     "enum": ["critical", "high", "normal", "low"],
                     "default": "normal",
                 },
+                "claude_bin": {
+                    "type": "string",
+                    "description": "Which CLI to use: 'claude' (Anthropic) or 'claudio'. Auto-detected if omitted.",
+                },
             },
             "required": ["prompt"],
         },
@@ -217,6 +221,8 @@ def _submit(args: dict) -> dict:
         "project_path": args.get("project_path", "/var/www/kraken/Dashboard"),
         "priority": args.get("priority", "normal"),
     }
+    if args.get("claude_bin"):
+        data["claude_bin"] = args["claude_bin"]
     res = _post("/api/submit", data)
     if "error" in res:
         return res

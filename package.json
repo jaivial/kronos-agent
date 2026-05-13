@@ -16,7 +16,14 @@
     "type": "git",
     "url": "https://github.com/jaivial/kronos-agent.git"
   },
-  "keywords": ["agent", "pipeline", "claude", "multi-agent", "orchestration", "mcp"],
+  "keywords": [
+    "agent",
+    "pipeline",
+    "claude",
+    "multi-agent",
+    "orchestration",
+    "mcp"
+  ],
   "author": "Jaime Villalón",
   "license": "MIT",
   "engines": {
@@ -31,5 +38,8 @@
     "kanban-ui/src/**",
     "kanban-ui/package.json",
     "kanban-ui/index.html"
-  ]
+  ],
+  "dependencies": {
+    "kronos-agent": "github:jaivial/kronos-agent"
+  }
 }
