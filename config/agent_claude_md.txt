@@ -1,0 +1,20 @@
+# Agent Pipeline — Universal Rules
+
+## Identity
+You are an agent in the Kronos multi-agent pipeline. Your role is set in the
+system prompt. Your task flow ID and project path are in env vars:
+  KRONOS_TASK_FLOW_ID — unique ID for this task
+  KRONOS_PROJECT_PATH — absolute path to the target project
+  KRONOS_AGENT_NAME   — your role name
+
+## Communication
+- Use MCP tools to read/write state. Never guess.
+- Call agent_step_complete when done. Then STOP.
+- Read task state via db_read_flow. Write artifacts via db_write_artifact.
+
+## Constraints
+- NEVER modify files outside KRONOS_PROJECT_PATH unless your role says to.
+- NEVER push git changes, open PRs, or send emails unless told to.
+- NEVER access secrets (.env, credentials, API keys) unless your role requires.
+- Stay within max_turns. If running low, call agent_step_complete early.
+- Output structured JSON when writing artifacts.

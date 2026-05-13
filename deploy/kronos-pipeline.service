@@ -1,0 +1,24 @@
+[Unit]
+Description=Kronos Agent Pipeline SDK
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/kraken/Kronos-Pipeline
+ExecStart=/usr/bin/python3 /var/www/kraken/Kronos-Pipeline/python/agent_pipeline.py
+Restart=on-failure
+RestartSec=10
+
+Environment=PIPELINE_PORT=8199
+Environment=PIPELINE_DATA_DIR=/var/www/kraken/Kronos-Pipeline/data
+Environment=PIPELINE_CONFIG_DIR=/var/www/kraken/Kronos-Pipeline/config
+Environment=PIPELINE_LOGS_DIR=/var/www/kraken/Kronos-Pipeline/logs
+Environment=IS_SANDBOX=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kronos-pipeline
+
+[Install]
+WantedBy=multi-user.target
