@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -19,6 +20,9 @@ from pipeline_config import (
     ROOT, DATA_DIR, AGENT_WORK_DIR, MINI_CLAUDE_MD,
     DISALLOWED_TOOLS, CLAUDE_BIN, AGENT_DEFAULTS,
 )
+
+# Module-level WS broadcast — set by agent_pipeline at import time
+broadcast_agent_log = lambda flow_id, step, line: None  # noqa: E731
 
 # ─── Data classes ──────────────────────────────────────────────────────────
 
@@ -36,6 +40,7 @@ class AgentSpawnConfig:
     prompt_override: str | None = None  # for retry scenarios
     phase_number: int | None = None     # for multi-phase executor (None = run all)
     claude_bin: str | None = None       # per-flow override: "claude" | "claudio"
+    model_name: str | None = None       # claudio model (e.g. "glm-5.1", "deepseekflash")
 
 
 @dataclass
@@ -93,15 +98,15 @@ MCP TOOLS AVAILABLE:
 - db_write_artifact(key, data): save JSON/text artifact
 - db_write_react_flow(nodes, edges): save impact graph to database
 - db_query(sql): read-only SQL queries
-- kraken_find(query, mode): hybrid semantic+keyword code search
-- kraken_impact(description): file-grouped impact analysis
-- kraken_file(path): read full indexed file content
-- kraken_index_status: check if Qdrant collection exists and is healthy
+- wr_find(query, mode, lang, role, layer): unified semantic/keyword/hybrid code search
+- wr_impact(description): file-grouped impact analysis (weights down stories/tests/locales)
+- wr_file(path): read full indexed file content (all chunks, ordered)
+- wr_index_status: check if Qdrant collection exists and is healthy
 
 STEPS:
 1. Call db_read_flow to get the task details.
-2. Call kraken_index_status to check if a Qdrant code index exists.
-   - If healthy: use kraken_find, kraken_impact, kraken_file for codebase search.
+2. Call wr_index_status to check if a Qdrant code index exists.
+   - If healthy: use wr_find, wr_impact, wr_file for codebase search.
    - If missing/unhealthy: fall back to directory listing + file reads in KRONOS_PROJECT_PATH.
      Use Bash("find KRONOS_PROJECT_PATH -type f -name '*.ts' -o -name '*.tsx' -o -name '*.cs' | head -50")
      then Read files directly.
@@ -352,6 +357,7 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
       - subprocess cwd set to neutral agent-work dir (no CLAUDE.md pollution)
       - --add-dir for dynamic project_path access
       - Role-specific system prompt via --append-system-prompt
+      - Real-time stdout streaming via WS broadcast + log file
     """
     AGENT_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -381,6 +387,9 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
         "--add-dir", config.project_path,       # dynamic project access
     ]
     cmd += ["--disallowed-tools", *DISALLOWED_TOOLS]
+    # Add model flag for claudio binary
+    if config.model_name and "claudio" in (bin_name.lower() or ""):
+        cmd += ["--model", config.model_name]
     cmd += ["-p", user_prompt]
 
     env = os.environ.copy()
@@ -389,41 +398,70 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
     env["KRONOS_AGENT_NAME"] = config.agent_name
     env["KRONOS_PROJECT_PATH"] = config.project_path
 
+    stdout_log = DATA_DIR / "logs" / f"agent-{config.agent_name}.stdout.log"
     stderr_log = DATA_DIR / "logs" / f"agent-{config.agent_name}.stderr.log"
-    stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+
+    all_stdout: list[str] = []
+    all_stderr: list[str] = []
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(AGENT_WORK_DIR),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=config.timeout_seconds,
         )
-        if proc.returncode != 0:
-            print(f"[spawner] claude exit={proc.returncode} stdout={len(proc.stdout or '')} stderr={len(proc.stderr or '')}", flush=True)
-            print(f"[spawner] stdout: {(proc.stdout or '')[:500]}", flush=True)
-            print(f"[spawner] stderr: {(proc.stderr or '')[:500]}", flush=True)
-    except subprocess.TimeoutExpired as e:
-        stderr_log.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read stdout line by line + stderr real-time using select
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        with stdout_log.open("a", encoding="utf-8") as sf, \
+             stderr_log.open("a", encoding="utf-8") as ef:
+            streams = {proc.stdout: ("stdout", all_stdout, sf),
+                       proc.stderr: ("stderr", all_stderr, ef)}
+            while proc.poll() is None:
+                rlist, _, _ = select.select([proc.stdout, proc.stderr], [], [], 1.0)
+                for fd in rlist:
+                    name, buf, fh = streams[fd]
+                    line = fd.readline()
+                    if line:
+                        buf.append(line)
+                        fh.write(line)
+                        fh.flush()
+                        # Broadcast both stdout and stderr for live log viewer
+                        tag = f"[{name}]"
+                        broadcast_agent_log(config.task_flow_id, config.agent_name, f"{tag} {line.rstrip(chr(10))}")
+            # Drain remaining
+            for fd, (name, buf, fh) in streams.items():
+                for line in fd.readlines():
+                    buf.append(line)
+                    fh.write(line)
+                    fh.flush()
+                    tag = f"[{name}]"
+                    broadcast_agent_log(config.task_flow_id, config.agent_name, f"{tag} {line.rstrip(chr(10))}")
+        proc.stdout.close()
+        proc.stderr.close()
+
+        proc.wait(timeout=config.timeout_seconds)
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         with stderr_log.open("a") as f:
             f.write(f"\n[agent-spawner] TIMEOUT after {config.timeout_seconds}s "
                     f"(agent={config.agent_name} flow={config.task_flow_id})\n")
-            if e.stderr:
-                f.write(e.stderr if isinstance(e.stderr, str)
-                        else e.stderr.decode("utf-8", "replace"))
         return AgentResult(
             ok=False, exit_code=124, result_text="",
             session_id=None, num_turns=0, total_cost_usd=0.0,
             stderr_tail=f"TIMEOUT after {config.timeout_seconds}s",
         )
 
-    if proc.stderr:
-        with stderr_log.open("a") as f:
-            f.write(proc.stderr)
+    raw = "".join(all_stdout)
+    stderr_tail = "".join(all_stderr)[-2000:]
 
-    raw = proc.stdout or ""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -432,7 +470,7 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
             exit_code=proc.returncode,
             result_text=raw[:50000],
             session_id=None, num_turns=0, total_cost_usd=0.0,
-            stderr_tail=(proc.stderr or "")[-2000:],
+            stderr_tail=stderr_tail,
         )
 
     # Check for API-level errors (429, 500, etc.) even if JSON is valid
@@ -458,7 +496,7 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
         session_id=data.get("session_id") or data.get("sessionId"),
         num_turns=int(data.get("num_turns") or 0),
         total_cost_usd=float(data.get("total_cost_usd") or 0.0),
-        stderr_tail=(proc.stderr or "")[-2000:],
+        stderr_tail=stderr_tail,
     )
 
 
@@ -486,12 +524,19 @@ def build_mcp_config(agent_name: str, flow_id: str,
         },
     }
     if agent_name in ("wide_research", "planner"):
-        search_mcp = ROOT / "python" / "kraken_search_mcp.py"
-        if search_mcp.exists():
-            servers["kraken-code-search"] = {
-                "command": "python3",
-                "args": [str(search_mcp)],
-            }
+        # Wide-researcher MCP (Qdrant-backed semantic code search)
+        servers["wide-researcher"] = {
+            "command": "node",
+            "args": [
+                "/var/www/wide-researcher/bin/wide-researcher-mcp.js",
+                "--project-config",
+                "/var/www/kraken/.wide-researcher/config.json",
+            ],
+            "env": {
+                "WIDE_RESEARCHER_PROJECT_CONFIG": "/var/www/kraken/.wide-researcher/config.json",
+                "PYTHON_BIN": "/root/.wide-researcher/venv/bin/python",
+            },
+        }
     if agent_name == "validator_2":
         browser_mcp = Path("/root/.hermes/mcp-servers/agent-browser-mcp.py")
         if browser_mcp.exists():

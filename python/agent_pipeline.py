@@ -15,8 +15,10 @@ Each step:
 from __future__ import annotations
 
 import asyncio
+import glob as glob_mod
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -38,8 +40,20 @@ from pipeline_config import (
     PIPELINE_STEPS, STEP_STATUS_MAP, AGENT_DEFAULTS,
 )
 import inbox_listener
+import worker_detector
 
 PORT = SDK_PORT
+
+# Wire agent_spawner's broadcast callback to our WS broadcast system
+def _agent_log_broadcast(flow_id: str, step: str, line: str) -> None:
+    _broadcast_sync({
+        "type": "agent_log_line",
+        "flow_id": flow_id,
+        "step": step,
+        "line": line,
+    })
+
+agent_spawner.broadcast_agent_log = _agent_log_broadcast
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────
 
@@ -178,26 +192,33 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
         timeout_seconds=600 if step_name != "validator_2" else 900,
         max_turns=40 if step_name != "wide_research" else 25,
         claude_bin=claude_bin,
+        model_name=flow.get("model_name"),
     )
 
     # Update flow status
     status = STEP_STATUS_MAP.get(step_name, "running")
     agent_db.update_flow_status(flow_id, status, current_step=step_name)
+    # Start step in DB
+    step_id = agent_db.start_step(flow_id, step_name, os.getpid())
     _broadcast_sync({
         "type": "step_starting",
         "flow_id": flow_id,
         "step": step_name,
+        "step_id": step_id,
         "status": status,
     })
-
-    # Start step in DB
-    step_id = agent_db.start_step(flow_id, step_name, os.getpid())
 
     # Spawn agent
     result = agent_spawner.spawn_agent(config)
 
+    # Auto-retry on credit/429 errors — switch model and restart step
+    if not result.ok and _is_credit_error(flow_id, result):
+        _handle_credit_retry(flow_id, step_name, step_id, config, result)
+        return
+
     # Record result
     if result.ok:
+        summary = _extract_summary(result.result_text)
         agent_db.complete_step(
             step_id,
             result_text=result.result_text,
@@ -205,10 +226,13 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
             turns=result.num_turns,
             cost=result.total_cost_usd,
         )
+        if summary:
+            agent_db.update_step_summary(step_id, summary)
         _broadcast_sync({
             "type": "step_completed",
             "flow_id": flow_id,
             "step": step_name,
+            "step_id": step_id,        # NEW
             "turns": result.num_turns,
             "cost": result.total_cost_usd,
         })
@@ -223,6 +247,7 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
             "type": "step_failed",
             "flow_id": flow_id,
             "step": step_name,
+            "step_id": step_id,        # NEW
             "error": result.stderr_tail[:500] if result.stderr_tail else "unknown",
         })
 
@@ -234,6 +259,193 @@ def _run_agent_inner(flow_id: str, step_name: str) -> None:
 
 
 # ─── Pipeline advancement ────────────────────────────────────────────────
+
+IMPACT_DIAGRAM_BASE = Path("/tmp/kraken-wide-research-api")
+
+
+def _extract_summary(text: str | None) -> str | None:
+    """Heuristic: extract short human-readable summary from agent result."""
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+    # Try JSON: extract a meaningful field
+    if t.startswith("{"):
+        try:
+            obj = json.loads(t)
+            if isinstance(obj, dict):
+                for key in ("summary", "result", "message", "status", "output", "description"):
+                    val = obj.get(key)
+                    if val and isinstance(val, str) and len(val) > 10:
+                        return val[:300]
+                # Return first string value
+                for v in obj.values():
+                    if isinstance(v, str) and len(v) > 10:
+                        return v[:300]
+        except json.JSONDecodeError:
+            pass
+    # Fallback: first 200 chars, no newlines
+    title = t.split("\n")[0][:200].strip()
+    return title if len(title) > 10 else None
+
+
+# ─── Credit error detection ───────────────────────────────────────────
+
+
+CREDIT_ERROR_KEYWORDS = [
+    "out of credits", "out of extra usage", "rate limit", "429",
+    "credit limit", "insufficient credits", "billing",
+    "api_error_status", "exceeded",
+]
+
+
+def _is_credit_error(flow_id: str, result: agent_spawner.AgentResult) -> bool:
+    """Check if the agent failed due to credit/rate-limit exhaustion."""
+    text = (result.stderr_tail or "") + " " + (result.result_text or "")
+    text_lower = text.lower()
+
+    # Check for 429 in stderr or result
+    for kw in CREDIT_ERROR_KEYWORDS:
+        if kw in text_lower:
+            # Record the failed model
+            flow = agent_db.get_flow(flow_id)
+            model = (flow or {}).get("model_name") or "default"
+            agent_db.add_tried_model(flow_id, model)
+            print(f"[pipeline] credit error detected for flow {flow_id[:8]} model={model}", flush=True)
+            return True
+
+    # Also check for structured JSON error in result_text
+    try:
+        data = json.loads(result.result_text or "{}")
+        if data.get("is_error") and data.get("api_error_status") == 429:
+            flow = agent_db.get_flow(flow_id)
+            model = (flow or {}).get("model_name") or "default"
+            agent_db.add_tried_model(flow_id, model)
+            print(f"[pipeline] structured 429 error for flow {flow_id[:8]} model={model}", flush=True)
+            return True
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    return False
+
+
+def _handle_credit_retry(
+    flow_id: str, step_name: str, step_id: int,
+    config: agent_spawner.AgentSpawnConfig,
+    result: agent_spawner.AgentResult,
+) -> None:
+    """Retry the step with next available model."""
+    tried = agent_db.get_tried_models(flow_id)
+    available = worker_detector.parse_litellm_models()
+    untried = [m for m in available if m["name"] not in tried]
+
+    if not untried:
+        # All models exhausted — fail the flow
+        error = f"All models exhausted (tried: {', '.join(tried)}). No remaining credits."
+        agent_db.fail_step(step_id, error_text=error)
+        agent_db.fail_flow(flow_id, error)
+        _broadcast_sync({
+            "type": "step_failed",
+            "flow_id": flow_id, "step": step_name, "step_id": step_id,
+            "error": error,
+        })
+        _broadcast_sync({
+            "type": "flow_failed",
+            "flow_id": flow_id, "error": error,
+        })
+        print(f"[pipeline] {error}", flush=True)
+        return
+
+    # Pick next model
+    next_model = untried[0]
+    print(f"[pipeline] retrying {step_name} with model {next_model['name']} "
+          f"(tried {tried}, {len(untried) - 1} remaining)", flush=True)
+
+    # Update flow with new model AND config
+    agent_db.update_flow_model(flow_id, next_model["name"])
+    config.claude_bin = "claudio"
+    config.model_name = next_model["name"]    # <--- THIS WAS MISSING
+
+    # Restart the step (create new step row, spawn agent)
+    new_step_id = agent_db.start_step(flow_id, step_name, os.getpid())
+    _broadcast_sync({
+        "type": "step_starting",
+        "flow_id": flow_id, "step": step_name,
+        "step_id": new_step_id, "status": "running",
+    })
+
+    new_result = agent_spawner.spawn_agent(config)
+
+    # Record new result
+    if new_result.ok:
+        summary = _extract_summary(new_result.result_text)
+        agent_db.complete_step(
+            new_step_id, result_text=new_result.result_text,
+            session_id=new_result.session_id,
+            turns=new_result.num_turns, cost=new_result.total_cost_usd,
+        )
+        if summary:
+            agent_db.update_step_summary(new_step_id, summary)
+        _broadcast_sync({
+            "type": "step_completed",
+            "flow_id": flow_id, "step": step_name,
+            "step_id": new_step_id,
+            "turns": new_result.num_turns, "cost": new_result.total_cost_usd,
+        })
+        # Cleanup old step's MCP config
+        try:
+            config.mcp_config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        # Resume pipeline from completion point
+        _advance_pipeline(flow_id, step_name, "done")
+    elif _is_credit_error(flow_id, new_result):
+        # Recursive retry with next model
+        _handle_credit_retry(flow_id, step_name, new_step_id, config, new_result)
+    else:
+        # Non-credit failure — fail for real
+        agent_db.fail_step(
+            new_step_id,
+            error_text=new_result.stderr_tail[:5000] if new_result.stderr_tail else "agent exited non-zero",
+            turns=new_result.num_turns, cost=new_result.total_cost_usd,
+        )
+        _broadcast_sync({
+            "type": "step_failed",
+            "flow_id": flow_id, "step": step_name, "step_id": new_step_id,
+            "error": new_result.stderr_tail[:500] if new_result.stderr_tail else "unknown",
+        })
+
+
+def _capture_impact_diagram(flow_id: str) -> None:
+    """Find the latest impact-diagram.html from wide_research and copy to artifacts."""
+    if not IMPACT_DIAGRAM_BASE.exists():
+        return
+    candidates = sorted(IMPACT_DIAGRAM_BASE.rglob("impact-diagram.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        return
+    src = candidates[0]
+    dest = agent_db.ARTIFACTS_DIR / f"{flow_id}_impact_diagram.html"
+    agent_db.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    agent_db.emit_event(flow_id, "artifact_linked", {
+        "step": "wide_research", "key": "impact_diagram", "path": str(dest),
+    })
+    print(f"[pipeline] captured impact diagram: {dest}", flush=True)
+
+
+def _generate_task_title(flow_id: str) -> None:
+    """Generate short title from original_prompt after prompt_enhancer completes."""
+    flow = agent_db.get_flow(flow_id)
+    if not flow:
+        return
+    source = flow.get("enhanced_prompt") or flow.get("original_prompt") or ""
+    # Clean: first ~60 chars, title-cased, no newlines
+    title = source.strip().split("\n")[0][:60].strip()
+    if not title:
+        return
+    # Remove trailing punctuation
+    title = title.rstrip(".,;:")
+    agent_db.update_flow_title(flow_id, title)
+    print(f"[pipeline] set title '{title}' for flow {flow_id[:8]}", flush=True)
 
 
 def _read_plan_phases(flow_id: str) -> list[dict] | None:
@@ -300,6 +512,7 @@ def _run_executor_phases(flow_id: str, project_path: str) -> None:
             timeout_seconds=AGENT_DEFAULTS["executor"]["timeout_seconds"],
             max_turns=AGENT_DEFAULTS["executor"]["max_turns"],
             claude_bin=claude_bin,
+            model_name=flow.get("model_name"),
         )
 
         agent_db.update_flow_status(flow_id, "executing", current_step=step_name)
@@ -376,15 +589,22 @@ def _advance_pipeline(flow_id: str, step_name: str, result: str,
         steps = agent_db.list_steps(flow_id)
         for s in reversed(steps):
             if s["step_name"] == step_name and s["status"] == "done":
-                import glob
                 for key in artifact_keys:
                     pattern = str(agent_db.ARTIFACTS_DIR / f"{flow_id}_{key}_*.json")
-                    matches = glob.glob(pattern)
+                    matches = glob_mod.glob(pattern)
                     if matches:
                         agent_db.emit_event(flow_id, "artifact_linked", {
                             "step": step_name, "key": key, "path": matches[-1],
                         })
                 break
+
+    # After wide_research completes, capture impact-diagram.html as artifact
+    if step_name == "wide_research" and result in ("done", "pass"):
+        _capture_impact_diagram(flow_id)
+
+    # After prompt_enhancer completes, generate task title
+    if step_name == "prompt_enhancer" and result in ("done", "pass"):
+        _generate_task_title(flow_id)
 
     # Special: after planner completes, start multi-phase executor loop
     if step_name == "planner" and result in ("done", "pass"):
@@ -461,6 +681,7 @@ class SubmitRequest(BaseModel):
     priority: str = "normal"
     metadata: dict | None = None
     claude_bin: str | None = None  # "claude" | "claudio" — defaults to auto-detect
+    model_name: str | None = None  # for claudio: which model to use
 
 
 class StepCompleteRequest(BaseModel):
@@ -484,6 +705,7 @@ async def submit_task(req: SubmitRequest) -> dict:
         priority=req.priority,
         metadata=req.metadata,
         claude_bin=req.claude_bin,
+        model_name=req.model_name,
     )
     # Start first agent in background
     t = threading.Thread(
@@ -538,6 +760,12 @@ async def stats() -> dict:
     return agent_db.summary_stats()
 
 
+@app.get("/api/worker-info")
+async def worker_info() -> dict:
+    """Detect installed binaries and available models."""
+    return worker_detector.get_worker_info()
+
+
 @app.get("/api/events")
 async def events(after_id: int = 0, limit: int = 100) -> dict:
     return {"events": agent_db.recent_events(after_id=after_id, limit=limit)}
@@ -550,6 +778,17 @@ async def get_react_flow(flow_id: str) -> dict:
     if graph is None:
         return {"nodes": [], "edges": []}
     return graph
+
+
+@app.get("/api/flows/{flow_id}/impact-diagram")
+async def get_impact_diagram(flow_id: str):
+    """Serve the impact-diagram.html for iframe embedding."""
+    from fastapi.responses import FileResponse
+    pattern = str(agent_db.ARTIFACTS_DIR / f"{flow_id}_impact_diagram.html")
+    matches = glob_mod.glob(pattern)
+    if not matches:
+        return {"error": "no impact diagram found"}
+    return FileResponse(matches[0], media_type="text/html")
 
 
 @app.post("/api/retry/{flow_id}")
@@ -747,7 +986,34 @@ def _fire_webhooks(event_kind: str, payload: dict) -> None:
             pass  # fire and forget
 
 
-# ─── Enhanced step detail ────────────────────────────────────────────────
+# ─── Logs endpoint ─────────────────────────────────────────────────────
+
+
+@app.get("/api/flows/{flow_id}/steps/{step_id}/logs")
+async def get_step_logs(flow_id: str, step_id: int, tail: int = 100) -> dict:
+    """Return last N lines of agent stdout log as fallback (WS primary)."""
+    import glob as _glob
+    # Find step by id to get step_name
+    with agent_db.connect() as c:
+        row = c.execute(
+            "SELECT step_name FROM task_steps WHERE id = ? AND task_flow_id = ?",
+            (step_id, flow_id),
+        ).fetchone()
+        if not row:
+            return {"error": "not found", "lines": []}
+    step_name = row["step_name"]
+    # Combine stdout + stderr logs
+    log_files = [
+        ("stdout", agent_spawner.ROOT / "data" / "logs" / f"agent-{step_name}.stdout.log"),
+        ("stderr", agent_spawner.ROOT / "data" / "logs" / f"agent-{step_name}.stderr.log"),
+    ]
+    all_lines: list[str] = []
+    for tag, path in log_files:
+        if path.exists():
+            for line in path.read_text(encoding="utf-8", errors="replace").rstrip().split("\n"):
+                if line.strip():
+                    all_lines.append(f"[{tag}] {line}")
+    return {"lines": all_lines[-tail:]}
 
 
 @app.get("/api/flows/{flow_id}/steps/{step_id}")
@@ -770,6 +1036,7 @@ async def get_step_detail(flow_id: str, step_id: int) -> dict:
 
 
 @app.websocket("/ws")
+@app.websocket("/kronos-ws")
 async def ws_events(ws: WebSocket) -> None:
     await ws.accept()
     with _ws_lock:
@@ -796,8 +1063,34 @@ async def on_startup() -> None:
     agent_db.init()
     orphans = agent_db.sweep_orphans()
     if orphans:
-        print(f"[pipeline] Swept {orphans} orphaned steps")
+        print(f"[pipeline] Swept {orphans} orphaned steps on startup")
     inbox_listener.start_inbox_listener()
+    # Start periodic orphan sweeper (every 5 min) to catch hard-crashed agents
+    _start_orphan_sweeper()
+
+
+_ORPHAN_SWEEPER_RUNNING = False
+
+
+def _start_orphan_sweeper() -> None:
+    global _ORPHAN_SWEEPER_RUNNING
+    if _ORPHAN_SWEEPER_RUNNING:
+        return
+    _ORPHAN_SWEEPER_RUNNING = True
+
+    async def _sweep_loop() -> None:
+        while True:
+            await asyncio.sleep(300)  # 5 min
+            try:
+                n = agent_db.sweep_orphans()
+                if n:
+                    print(f"[pipeline] Periodic sweep: {n} orphans cleaned", flush=True)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=lambda: asyncio.run(_sweep_loop()), daemon=True)
+    t.start()
+    print("[pipeline] Orphan sweeper started (interval=300s)", flush=True)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────

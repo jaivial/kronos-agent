@@ -158,6 +158,15 @@ def init() -> None:
             c.execute("ALTER TABLE task_flows ADD COLUMN react_flow_json TEXT")
         if "claude_bin" not in cols:
             c.execute("ALTER TABLE task_flows ADD COLUMN claude_bin TEXT")
+        if "title" not in cols:
+            c.execute("ALTER TABLE task_flows ADD COLUMN title TEXT")
+        step_cols = [r[1] for r in c.execute("PRAGMA table_info(task_steps)").fetchall()]
+        if "result_summary" not in step_cols:
+            c.execute("ALTER TABLE task_steps ADD COLUMN result_summary TEXT")
+        if "model_name" not in cols:
+            c.execute("ALTER TABLE task_flows ADD COLUMN model_name TEXT")
+        if "tried_models" not in cols:
+            c.execute("ALTER TABLE task_flows ADD COLUMN tried_models TEXT DEFAULT '[]'")
 
 
 # ─── Task Flows ───────────────────────────────────────────────────────────
@@ -173,6 +182,7 @@ def create_task_flow(
     metadata: dict | None = None,
     current_step: str = "wide_research",
     claude_bin: str | None = None,
+    model_name: str | None = None,
 ) -> str:
     """Create a new task flow. Returns the flow UUID."""
     import uuid
@@ -182,13 +192,13 @@ def create_task_flow(
             """
             INSERT INTO task_flows
               (id, source, project_path, qdrant_collection, original_prompt,
-               priority, current_step, metadata_json, claude_bin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               priority, current_step, metadata_json, claude_bin, model_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (flow_id, source, project_path, qdrant_collection, prompt,
              priority, current_step,
              json.dumps(metadata or {}),
-             claude_bin),
+             claude_bin, model_name),
         )
         _emit_event(c, flow_id, "flow_created",
                     {"id": flow_id, "source": source,
@@ -283,6 +293,58 @@ def read_react_flow(flow_id: str) -> dict | None:
             return None
 
 
+def update_flow_title(flow_id: str, title: str) -> bool:
+    with connect() as c:
+        cur = c.execute(
+            "UPDATE task_flows SET title = ?, updated_at = ? WHERE id = ?",
+            (title[:200], now(), flow_id),
+        )
+        return cur.rowcount > 0
+
+
+def update_step_summary(step_id: int, summary: str) -> bool:
+    with connect() as c:
+        cur = c.execute(
+            "UPDATE task_steps SET result_summary = ? WHERE id = ?",
+            (summary[:500], step_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_tried_models(flow_id: str) -> list[str]:
+    with connect() as c:
+        row = c.execute(
+            "SELECT tried_models FROM task_flows WHERE id = ?", (flow_id,)
+        ).fetchone()
+        if not row or not row["tried_models"]:
+            return []
+        try:
+            return json.loads(row["tried_models"])
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+
+def add_tried_model(flow_id: str, model: str) -> bool:
+    tried = get_tried_models(flow_id)
+    if model not in tried:
+        tried.append(model)
+    with connect() as c:
+        cur = c.execute(
+            "UPDATE task_flows SET tried_models = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(tried), now(), flow_id),
+        )
+        return cur.rowcount > 0
+
+
+def update_flow_model(flow_id: str, model: str) -> bool:
+    with connect() as c:
+        cur = c.execute(
+            "UPDATE task_flows SET model_name = ?, updated_at = ? WHERE id = ?",
+            (model, now(), flow_id),
+        )
+        return cur.rowcount > 0
+
+
 def list_task_flows(
     *, status: str | None = None, limit: int = 20,
 ) -> list[dict[str, Any]]:
@@ -295,7 +357,7 @@ def list_task_flows(
     with connect() as c:
         rows = c.execute(
             f"""
-            SELECT id, source, project_path, status, current_step,
+            SELECT id, source, project_path, title, status, current_step,
                    retry_count, priority, created_at, updated_at, completed_at
               FROM task_flows {where}
              ORDER BY created_at DESC LIMIT ?
@@ -560,6 +622,7 @@ def latest_event_id() -> int:
 
 def sweep_orphans() -> int:
     """Mark steps still in 'running' as failed (service restarted mid-step)."""
+    orphaned_flows: set[str] = set()
     with connect() as c:
         rows = c.execute(
             "SELECT id, task_flow_id, step_name FROM task_steps WHERE status = 'running'"
@@ -572,6 +635,22 @@ def sweep_orphans() -> int:
             )
             _emit_event(c, r["task_flow_id"], "step_failed",
                         {"step": r["step_name"], "reason": "orphaned"})
+            orphaned_flows.add(r["task_flow_id"])
+        # Also mark parent flows that are stuck and have no running steps
+        if orphaned_flows:
+            for fid in orphaned_flows:
+                remaining = c.execute(
+                    "SELECT COUNT(*) FROM task_steps WHERE task_flow_id = ? AND status = 'running'",
+                    (fid,),
+                ).fetchone()[0]
+                if remaining == 0:
+                    # No more running steps — mark flow as failed
+                    c.execute(
+                        "UPDATE task_flows SET status = 'failed', "
+                        "error_reason = 'orphaned steps', "
+                        "updated_at = ?, completed_at = ? WHERE id = ? AND status NOT IN ('done','failed')",
+                        (now(), now(), fid),
+                    )
         return len(rows)
 
 
