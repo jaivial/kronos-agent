@@ -71,11 +71,11 @@ kronos_submit(prompt="fix the login bug")
 | Component | Role |
 |-----------|------|
 | `agent_pipeline.py` | FastAPI SDK — pipeline router, REST API, WebSocket, webhook dispatch |
-| `agent_spawner.py` | Builds `claude -p` commands with role prompts + MCP configs |
+| `agent_spawner.py` | Builds `claude -p` commands with role prompts + MCP configs. Supports per-flow binary selection (`claude` or `claudio`) |
 | `agent_mcp.py` | Notification MCP — `agent_step_complete` callback to SDK |
 | `sqlite_mcp.py` | Data MCP — agents read flow state, write artifacts, store react_flow graphs |
 | `agent_db.py` | SQLite WAL data layer — task_flows, steps, events, skills, subagents, webhooks |
-| `pipeline_config.py` | Centralized config — all tuneable params via env vars |
+| `pipeline_config.py` | Centralized config — all tuneable params via env vars. Auto-resolves `claude` binary via `shutil.which()` |
 | `inbox_listener.py` | IMAP polling + Mailgun webhook for email-based task submission |
 | `kronos_pipeline_mcp.py` | Claude session MCP — submit/monitor from any Claude or claudio session |
 | `kanban-ui/` | React + @xyflow/react — dark theme flow list + impact graph viewer |
@@ -101,10 +101,16 @@ After install, **restart your Claude session** for MCP tools to appear.
 
 ## Usage
 
-### From any Claude session (MCP)
+### From any Claude/claudio session (MCP)
 
 ```
 kronos_submit(prompt="fix the login button z-index on mobile", project_path="/var/www/kraken/Dashboard")
+```
+
+Use `claudio` instead of `claude` per task:
+
+```
+kronos_submit(prompt="fix the login bug", claude_bin="claudio")
 ```
 
 8 MCP tools available: `kronos_submit`, `kronos_status`, `kronos_list`, `kronos_cancel`, `kronos_retry`, `kronos_react_flow`, `kronos_step_detail`, `kronos_stats`
@@ -112,10 +118,15 @@ kronos_submit(prompt="fix the login button z-index on mobile", project_path="/va
 ### Via HTTP API
 
 ```bash
-# Submit task
+# Submit task (defaults to auto-detected claude binary)
 curl -X POST http://localhost:8199/api/submit \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"fix the header overflow bug","project_path":"/var/www/kraken/Dashboard"}'
+
+# Submit task with claudio binary
+curl -X POST http://localhost:8199/api/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"fix the header overflow bug","project_path":"/var/www/kraken/Dashboard","claude_bin":"claudio"}'
 
 # Check status
 curl http://localhost:8199/api/flows/{flow_id}
@@ -131,11 +142,26 @@ curl http://localhost:8199/api/flows/{flow_id}/react-flow
 
 Send an email with subject `[pipeline] /path/to/project` — the body becomes the task prompt. Configure IMAP or Mailgun webhook.
 
+## Binary Selection (`claude` vs `claudio`)
+
+Every task flow can choose which CLI binary to use. This lets external apps route tasks to different AI backends dynamically.
+
+| Parameter | Values | Behavior |
+|-----------|--------|----------|
+| `claude_bin` (API) / `claude_bin` (MCP) | `"claude"`, `"claudio"`, or omit | Per-task override. Falls back to auto-detection if omitted. |
+
+Auto-detection order:
+1. `CLAUDE_BIN` env var
+2. `shutil.which("claude")` → resolves full path at startup
+3. `"claude"` as final fallback
+
+The selected binary is stored in `task_flows.claude_bin` and used for **all agents** in that flow (research, planner, executor, validators).
+
 ## REST API
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/submit` | POST | Submit new task flow |
+| `/api/submit` | POST | Submit new task flow (accepts `claude_bin`, `priority`, `metadata`) |
 | `/api/flows` | GET | List flows (filter by status) |
 | `/api/flows/{id}` | GET | Full flow state + steps + events + artifacts |
 | `/api/flows/{id}/react-flow` | GET | React Flow impact graph JSON |
@@ -180,6 +206,16 @@ Key design decisions:
 | `frontend-ux` | a11y, keyboard, loading states |
 | `backend-dev` | `**/*.cs` |
 
+## Error Handling
+
+The pipeline handles errors at multiple levels:
+
+- **API errors** (429 rate limit, 500 server error): parsed from claude's JSON output and stored as clear error messages in `task_flows.error_reason`
+- **Agent crashes**: `_run_agent` wraps in try/except, logs stack traces to journald, marks step as failed
+- **Phase failures**: retry up to `PIPELINE_MAX_RETRIES` (default 3) before failing the flow
+- **SDK crashes**: systemd `Restart=on-failure` auto-restarts the service within 10 seconds
+- **Orphan cleanup**: on startup, `sweep_orphans()` resets any flows left in transient states
+
 ## Configuration
 
 All tuneable via environment variables:
@@ -187,13 +223,13 @@ All tuneable via environment variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PIPELINE_PORT` | `8199` | SDK HTTP port |
-| `PIPELINE_MAX_RETRIES` | `3` | Max retry attempts |
+| `PIPELINE_MAX_RETRIES` | `3` | Max retry attempts per phase |
 | `PIPELINE_SDK_URL` | `http://localhost:8199` | SDK base URL |
 | `PIPELINE_INBOX_POLL_INTERVAL` | `60` | IMAP poll interval (seconds) |
 | `PIPELINE_IMAP_HOST` | — | IMAP host for inbox listener |
 | `PIPELINE_IMAP_USER` | — | IMAP username |
 | `PIPELINE_IMAP_PASS` | — | IMAP password |
-| `CLAUDE_BIN` | `claude` | Path to claude binary |
+| `CLAUDE_BIN` | auto-detect | Override claude binary path globally |
 | `PIPELINE_LOG_LEVEL` | `info` | Log level |
 
 ## License
