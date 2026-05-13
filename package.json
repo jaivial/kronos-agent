@@ -1,6 +1,6 @@
 {
   "name": "kronos-agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Multi-agent orchestration SDK — 6-step pipeline with fresh claude -p subprocesses, SQLite state, FastAPI router, WebSocket, React Flow",
   "bin": {
     "kronos-install": "./scripts/install.sh",

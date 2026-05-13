@@ -214,6 +214,131 @@ def _run_agent(flow_id: str, step_name: str) -> None:
 # ─── Pipeline advancement ────────────────────────────────────────────────
 
 
+def _read_plan_phases(flow_id: str) -> list[dict] | None:
+    """Read the plan artifact and return phases list, or None."""
+    import glob
+    pattern = str(agent_db.ARTIFACTS_DIR / f"{flow_id}_plan_*.json")
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    data = agent_db.read_artifact(matches[-1])
+    if isinstance(data, dict) and "phases" in data:
+        return data["phases"]
+    return None
+
+
+def _run_executor_phases(flow_id: str, project_path: str) -> None:
+    """Run each plan phase as a separate executor subprocess.
+
+    Reads the plan artifact, iterates phases, spawns one executor per phase.
+    After all phases complete, advances to validator_1.
+    """
+    phases = _read_plan_phases(flow_id)
+    if not phases:
+        # No plan found — run single executor (legacy fallback)
+        _run_agent(flow_id, "executor")
+        return
+
+    _broadcast_sync({
+        "type": "multi_phase_execution",
+        "flow_id": flow_id,
+        "total_phases": len(phases),
+    })
+
+    for phase in phases:
+        phase_num = phase.get("phase", 0)
+        step_name = f"executor_phase_{phase_num}"
+
+        mcp_config = agent_spawner.build_mcp_config("executor", flow_id, project_path)
+        user_prompt = (
+            f"PIPELINE TASK\n"
+            f"  task_flow_id: {flow_id}\n"
+            f"  your_step: executor (phase {phase_num} of {len(phases)})\n"
+            f"  project_path: {project_path}\n"
+            f"  phase_number: {phase_num}\n\n"
+            f"Execute ONLY phase {phase_num}. "
+            f"Description: {phase.get('description', '')}\n"
+            f"Skill: {phase.get('skill', 'unknown')}\n"
+            f"Files: {', '.join(phase.get('files', []))}\n"
+            f"Acceptance: {'; '.join(phase.get('acceptance', []))}\n"
+            f"Context from previous phases: {phase.get('context', 'first phase')}\n\n"
+            f"Read the task flow via db_read_flow MCP tool for full details.\n"
+            f"Call agent_step_complete when done.\n"
+        )
+
+        config = agent_spawner.AgentSpawnConfig(
+            agent_name="executor",
+            task_flow_id=flow_id,
+            project_path=project_path,
+            mcp_config_path=mcp_config,
+            user_prompt=user_prompt,
+            phase_number=phase_num,
+            timeout_seconds=AGENT_DEFAULTS["executor"]["timeout_seconds"],
+            max_turns=AGENT_DEFAULTS["executor"]["max_turns"],
+        )
+
+        agent_db.update_flow_status(flow_id, "executing", current_step=step_name)
+        _broadcast_sync({
+            "type": "step_starting",
+            "flow_id": flow_id,
+            "step": step_name,
+            "phase": phase_num,
+            "total_phases": len(phases),
+        })
+
+        step_id = agent_db.start_step(flow_id, step_name, os.getpid())
+        result = agent_spawner.spawn_agent(config)
+
+        if result.ok:
+            agent_db.complete_step(
+                step_id,
+                result_text=result.result_text,
+                session_id=result.session_id,
+                turns=result.num_turns,
+                cost=result.total_cost_usd,
+            )
+            _broadcast_sync({
+                "type": "step_completed",
+                "flow_id": flow_id,
+                "step": step_name,
+                "phase": phase_num,
+                "turns": result.num_turns,
+                "cost": result.total_cost_usd,
+            })
+        else:
+            agent_db.fail_step(
+                step_id,
+                error_text=result.stderr_tail[:5000] if result.stderr_tail else "executor phase failed",
+                turns=result.num_turns,
+                cost=result.total_cost_usd,
+            )
+            _broadcast_sync({
+                "type": "step_failed",
+                "flow_id": flow_id,
+                "step": step_name,
+                "phase": phase_num,
+                "error": result.stderr_tail[:500] if result.stderr_tail else "unknown",
+            })
+            # Phase failed — retry or fail the flow
+            flow = agent_db.get_flow(flow_id)
+            retry_count = (flow or {}).get("retry_count", 0)
+            if retry_count < MAX_RETRIES:
+                agent_db.update_flow_retry(flow_id, retry_count + 1)
+                # Re-run this phase
+                continue
+            else:
+                agent_db.fail_flow(flow_id, f"Phase {phase_num} failed after {MAX_RETRIES} retries")
+                return
+
+        try:
+            mcp_config.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # All phases done — advance to validator_1
+    _advance_pipeline(flow_id, "executor", "done")
+
+
 def _advance_pipeline(flow_id: str, step_name: str, result: str,
                       artifact_keys: list[str] | None = None) -> None:
     """Called after a step completes. Decides next action."""
@@ -226,7 +351,6 @@ def _advance_pipeline(flow_id: str, step_name: str, result: str,
         steps = agent_db.list_steps(flow_id)
         for s in reversed(steps):
             if s["step_name"] == step_name and s["status"] == "done":
-                # Find artifact files for these keys
                 import glob
                 for key in artifact_keys:
                     pattern = str(agent_db.ARTIFACTS_DIR / f"{flow_id}_{key}_*.json")
@@ -237,15 +361,37 @@ def _advance_pipeline(flow_id: str, step_name: str, result: str,
                         })
                 break
 
+    # Special: after planner completes, start multi-phase executor loop
+    if step_name == "planner" and result in ("done", "pass"):
+        project_path = flow["project_path"]
+        t = threading.Thread(
+            target=_run_executor_phases,
+            args=(flow_id, project_path),
+            name=f"executor-phases-{flow_id[:8]}",
+            daemon=True,
+        )
+        t.start()
+        return
+
+    # Special: after executor completes (single-phase fallback), go to validator
+    if step_name == "executor" and result in ("done", "pass"):
+        next_step = "validator_1"
+        t = threading.Thread(
+            target=_run_agent,
+            args=(flow_id, next_step),
+            name=f"agent-{next_step}-{flow_id[:8]}",
+            daemon=True,
+        )
+        t.start()
+        return
+
     next_step = _next_step(step_name, result)
 
     if next_step is None:
         if result in ("fail", "failed"):
-            # Check retry budget
             retry_count = flow.get("retry_count", 0)
             if retry_count < MAX_RETRIES:
                 agent_db.update_flow_retry(flow_id, retry_count + 1)
-                # Restart from executor
                 next_step = "executor"
                 _broadcast_sync({
                     "type": "flow_retrying",
@@ -262,7 +408,6 @@ def _advance_pipeline(flow_id: str, step_name: str, result: str,
                 })
                 return
         else:
-            # Pipeline complete
             agent_db.update_flow_status(flow_id, "done")
             agent_db.emit_event(flow_id, "flow_done", {"steps_completed": len(PIPELINE_STEPS)})
             _broadcast_sync({
@@ -271,7 +416,6 @@ def _advance_pipeline(flow_id: str, step_name: str, result: str,
             })
             return
 
-    # Spawn next agent in background
     t = threading.Thread(
         target=_run_agent,
         args=(flow_id, next_step),
