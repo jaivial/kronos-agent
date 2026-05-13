@@ -347,8 +347,8 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
     """Run `claude -p ...` as a subprocess. Blocks until done.
 
     Uses:
-      - Mini project-agnostic CLAUDE.md (not the host project's rules)
-      - --cwd set to neutral agent-work dir (no CLAUDE.md pollution)
+      - Mini project-agnostic CLAUDE.md injected via --append-system-prompt
+      - subprocess cwd set to neutral agent-work dir (no CLAUDE.md pollution)
       - --add-dir for dynamic project_path access
       - Role-specific system prompt via --append-system-prompt
     """
@@ -372,8 +372,6 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
         "--strict-mcp-config",
         "--append-system-prompt", full_system,
         "--effort", config.effort,
-        "--max-turns", str(config.max_turns),
-        "--cwd", str(AGENT_WORK_DIR),          # neutral dir, no host CLAUDE.md
         "--add-dir", config.project_path,       # dynamic project access
     ]
     cmd += ["--disallowed-tools", *DISALLOWED_TOOLS]
