@@ -1,0 +1,35 @@
+{
+  "name": "kronos-agent",
+  "version": "1.0.0",
+  "description": "Multi-agent orchestration SDK — 6-step pipeline with fresh claude -p subprocesses, SQLite state, FastAPI router, WebSocket, React Flow",
+  "bin": {
+    "kronos-install": "./scripts/install.sh",
+    "kronos-uninstall": "./scripts/uninstall.sh",
+    "kronos-status": "./scripts/status.sh"
+  },
+  "scripts": {
+    "postinstall": "bash scripts/install.sh",
+    "preuninstall": "bash scripts/uninstall.sh",
+    "status": "bash scripts/status.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaivial/kronos-agent.git"
+  },
+  "keywords": ["agent", "pipeline", "claude", "multi-agent", "orchestration", "mcp"],
+  "author": "Jaime Villalón",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "python/**",
+    "config/**",
+    "deploy/**",
+    "scripts/**",
+    "kanban-ui/dist/**",
+    "kanban-ui/src/**",
+    "kanban-ui/package.json",
+    "kanban-ui/index.html"
+  ]
+}
