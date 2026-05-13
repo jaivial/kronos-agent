@@ -15,6 +15,7 @@ Environment=PIPELINE_DATA_DIR=/var/www/kraken/Kronos-Pipeline/data
 Environment=PIPELINE_CONFIG_DIR=/var/www/kraken/Kronos-Pipeline/config
 Environment=PIPELINE_LOGS_DIR=/var/www/kraken/Kronos-Pipeline/logs
 Environment=IS_SANDBOX=1
+Environment=PATH=/root/.nvm/versions/node/v20.20.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 StandardOutput=journal
 StandardError=journal

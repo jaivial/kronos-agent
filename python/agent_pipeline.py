@@ -123,15 +123,35 @@ def _next_step(current: str, result: str) -> str | None:
 
 def _run_agent(flow_id: str, step_name: str) -> None:
     """Spawn an agent in a background thread. Handles success/failure/retry."""
+    try:
+        _run_agent_inner(flow_id, step_name)
+    except Exception as exc:
+        import traceback
+        print(f"[pipeline] _run_agent CRASH: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        # Mark step as failed so the flow doesn't hang
+        try:
+            steps = agent_db.list_steps(flow_id)
+            active = [s for s in steps if s["step_name"] == step_name and s["status"] == "running"]
+            if active:
+                agent_db.fail_step(active[0]["id"], error_text=f"_run_agent crash: {exc}")
+        except Exception:
+            pass
+
+
+def _run_agent_inner(flow_id: str, step_name: str) -> None:
+    """Spawn an agent in a background thread. Handles success/failure/retry."""
     flow = agent_db.get_flow(flow_id)
     if not flow:
         return
 
     project_path = flow["project_path"]
+    print(f"[pipeline] Spawning {step_name} for flow {flow_id[:8]} project={project_path}", flush=True)
 
     # Build MCP config for this agent
     mcp_config = agent_spawner.build_mcp_config(step_name, flow_id, project_path)
     user_prompt = agent_spawner.build_user_prompt(flow_id, step_name, project_path)
+    print(f"[pipeline] MCP config: {mcp_config} exists={mcp_config.exists()}", flush=True)
 
     # Check if this is a retry — build override context
     prompt_override = None

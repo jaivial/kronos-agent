@@ -86,7 +86,15 @@ AGENT_DEFAULTS: dict[str, dict] = {
 
 # ─── Claude binary ──────────────────────────────────────────────────────
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+def _resolve_claude_bin() -> str:
+    env = os.environ.get("CLAUDE_BIN")
+    if env:
+        return env
+    import shutil
+    p = shutil.which("claude")
+    return p or "claude"
+
+CLAUDE_BIN = _resolve_claude_bin()
 
 # ─── Disallowed tools (safety guard) ────────────────────────────────────
 

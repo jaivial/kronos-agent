@@ -395,6 +395,10 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
             text=True,
             timeout=config.timeout_seconds,
         )
+        if proc.returncode != 0:
+            print(f"[spawner] claude exit={proc.returncode} stdout={len(proc.stdout or '')} stderr={len(proc.stderr or '')}", flush=True)
+            print(f"[spawner] stdout: {(proc.stdout or '')[:500]}", flush=True)
+            print(f"[spawner] stderr: {(proc.stderr or '')[:500]}", flush=True)
     except subprocess.TimeoutExpired as e:
         stderr_log.parent.mkdir(parents=True, exist_ok=True)
         with stderr_log.open("a") as f:
@@ -423,6 +427,22 @@ def spawn_agent(config: AgentSpawnConfig) -> AgentResult:
             result_text=raw[:50000],
             session_id=None, num_turns=0, total_cost_usd=0.0,
             stderr_tail=(proc.stderr or "")[-2000:],
+        )
+
+    # Check for API-level errors (429, 500, etc.) even if JSON is valid
+    api_error = data.get("api_error_status")
+    is_error = data.get("is_error", False)
+    result_msg = str(data.get("result") or "")
+    if api_error or is_error:
+        error_desc = result_msg or f"API error {api_error}"
+        return AgentResult(
+            ok=False,
+            exit_code=proc.returncode,
+            result_text=error_desc[:50000],
+            session_id=data.get("session_id"),
+            num_turns=int(data.get("num_turns") or 0),
+            total_cost_usd=float(data.get("total_cost_usd") or 0.0),
+            stderr_tail=error_desc[:2000],
         )
 
     return AgentResult(
